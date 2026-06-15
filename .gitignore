@@ -1,0 +1,7 @@
+venv/
+*.csv
+.DS_Store
+__pycache__/
+.idea/
+.ipynb_checkpoints/
+!unified_rate_dataset.csv
