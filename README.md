@@ -18,6 +18,11 @@ run a block-level join followed by a greedy price-proximity match within each
 block. Everything that doesn't match — on either side — is kept in the output
 and labeled with why.
 
+The output is a single unified dataset (`unified_rate_dataset.csv`) where every
+row carries a `data_source` (`hpt_only` / `tic_only` / `both`) and a
+`match_category` explaining *why* it landed there, plus a price-based
+`match_confidence` band for actual matches.
+
 Two files matter most for review:
 
 - `Exploratory_Analysis.ipynb` — the full walkthrough, with every decision
@@ -44,15 +49,15 @@ Before any join happens, every HPT row gets tagged with a `match_eligibility`
 category. Four exclusion rules came directly out of looking at the data with
 a claims-background lens rather than treating it as generic tabular data:
 
-**Payer isn't one of the big three.** HPT lists 73 distinct payer name
+**1. Payer isn't one of the big three.** HPT lists 73 distinct payer name
 variants; TiC only covers Aetna, Cigna, and UnitedHealthcare. Everything else
 (HealthFirst, Oxford, Medicaid managed care plans, etc.) simply has nothing to
 compare against and is excluded as `excluded_non_big3_payer`. This accounts
-for the bulk of the 2,855-row final output (2,577 rows) — not because
+for the bulk of the final output (2,577 rows) — not because
 something went wrong, but because HPT's payer universe is just much bigger
 than TiC's in this extract.
 
-**LOCAL code type at NYU Langone.** 410 rows are tagged `code_type = LOCAL`
+**2. LOCAL code type at NYU Langone.** 410 rows are tagged `code_type = LOCAL`
 with `raw_code = 43239`. CPT 43239 is an upper GI endoscopy with biopsy. But
 the descriptions on these LOCAL rows read things like "HEAD HUM 19MM 50MM
 SHLDR UNIVERS STRL LF CUF ARTHROPATHY" — a shoulder implant component. The
@@ -61,14 +66,18 @@ isn't an edge case to work around; it's a data encoding error, and these rows
 are excluded entirely (`excluded_local_code_inconsistent`) rather than forced
 into a CPT bucket they don't belong in.
 
-**Non-commercial plans.** The TiC extract is explicitly drawn from "national
+**3. Non-commercial plans.** The TiC extract is explicitly drawn from "national
 PPO files" — commercial plans only. HPT, on the other hand, reports
 everything including Medicare and Medicare Advantage. 22 rows with plan names
 like "Medicare" or "Medicare Advantage, Community Plan Medicare Advantage" are
 excluded as `excluded_non_commercial_plan`. This is a scope mismatch, not a
 data quality problem — there was never going to be a TiC counterpart for these.
 
-**Missing negotiated rate.** 17 rows have no usable
+However, this likely undercounts the true non-commercial population, as cryptic variants (e.g., "aetnaindemnity1006") may disguise other non-commercial.Fully resolving this status across hundreds of unpredictable plan variants requires domain expertise or a payer-provided taxonomy. For long-term scalability, this logic should be shifted away from ad hoc string matching and into a curated plan mapping table.
+
+**4. Missing negotiated rate.** For this project only `standard_charge_negotiated_dollar` is relevant — it represents the payer-specific contracted rate and is the direct equivalent of the TiC rate column. Gross charge and cash price are not compared with TiC rate.
+
+ HPT 17 rows have no usable
 `standard_charge_negotiated_dollar` value. I checked whether
 `gross_charge × negotiated_percentage` could recover these — it can't, either
 the gross charge is also missing or the methodology isn't percentage-based.
@@ -77,55 +86,52 @@ With only 17 rows and no viable imputation path, these are excluded
 
 ## Identifier and Code Normalization
 
-**Hospital identity.** TiC identifies hospitals by EIN; HPT uses
+**1. Hospital identity.** TiC identifies hospitals by EIN; HPT uses
 `license_number`, which is a different identifier system entirely. Montefiore's
 license (`13-1740114`) happens to strip-format into its EIN (`131740114`)
 directly. Mount Sinai and NYU Langone don't — their HPT license numbers are
 state license formats, not EINs, so I resolved their actual federal EINs from
 public records (`13-1624096` and `13-3971298` respectively) and built a small
 lookup table. At national scale this wouldn't be a one-off lookup — it'd be a
-maintained crosswalk table (NPI → EIN → hospital name, sourced from NPPES),
+maintained crosswalk table (NPI → EIN → hospital name, sourced from public records),
 with fuzzy name + geography matching as a fallback for records that don't
 resolve cleanly.
 
-**Payer names.** TiC uses clean lowercase slugs (`aetna`,
+**2. Payer names.** TiC uses clean lowercase slugs (`aetna`,
 `unitedhealthcare`, `cigna-corporation`). HPT has the same three payers under
 dozens of spellings — "Aetna", "aetna", "United", "UHC", "United Healthcare".
 A normalization function lives in its own `payer_mapping.py` module with a
 small test suite, specifically so it can be extended as new HPT files
 introduce new variants without touching the matching logic itself.
 
-**Billing codes.** HPT writes the DRG code as either `872` or `MS-DRG 872`
+**3. Billing codes.** HPT writes the DRG code as either `872` or `MS-DRG 872`
 depending on the hospital; both get stripped down to a plain `872` so the two
 files use the same code format.
 
 ## Billing Class — Why It Had to Become a Hard Join Key
 
-TiC splits every rate by `billing_class` — institutional (facility) vs.
+**Billing class inference:** TiC splits every rate by `billing_class` — institutional (facility) vs.
 professional (physician). HPT doesn't have this column at all, so it has to be
-inferred: MS-DRG codes are always institutional (they're inpatient episode
-bundles), descriptions prefixed with "PR " are professional (a consistent
+inferred based below rules: 
+- MS-DRG codes are always institutional (they're inpatient episode
+bundles);
+- Descriptions prefixed with "PR " are professional (a consistent
 hospital convention for physician-billed services), and everything else
 defaults to institutional.
 
-I initially treated billing_class as a secondary signal rather than a join
-key, but the actual distributions argued strongly against that. Among
-eligible rows, HPT is 93% institutional (266 vs. 21 professional) while TiC is
-80% professional (177 vs. 45 institutional) — almost mirror images of each
-other. And the rate magnitudes confirm these aren't interchangeable: for CPT
-43239, institutional rates average roughly $6,300-7,400 on both sides, while
-professional rates average $424-1,500 — a 5-15x gap, consistent across all
-three payers. An HPT institutional rate landing anywhere near a TiC
-professional rate for the same code would be coincidence, not a real match.
-So `billing_class` joined `ein`, `payer_canonical`, `code_clean`, and
-`code_type` as a hard join key — without it, every institutional HPT rate
+This inference is an assumption — HPT does not explicitly confirm billing class. At scale, modifier codes (e.g. modifier 26 for professional component, TC for technical component) would provide a more reliable signal. 
+
+Including billing_class as a hard join key is necessary to avoid a massive combinatorial explosion of incomparable records, driven by the opposite structural imbalances between HPT (93% institutional) and TiC (80% professional) datasets. Furthermore, institutional facility fees are consistently 5 to 15 times higher than professional fees for the same procedure, meaning a failure to use this key results in spurious matches between incompatible data types. Therefore, anchoring the match on billing_class ensures like-for-like comparisons, preventing data bloat and ensuring accuracy.
+
+So **`billing_class` joined `ein`, `payer_canonical`, `code_clean`, and
+`code_type`** as a hard join key — without it, every institutional HPT rate
 would get compared against a pile of professional TiC rates it has no
 business being compared to.
 
 Two other fields came up as candidates for join keys and were deliberately
 **not** used that way:
 
-`plan_name` on the HPT side is extremely fragmented — things like
+**`plan_name`** on the HPT side is extremely fragmented — things like
 "aetnaopenaccesschoice(epo)1415" or "unitedhealthcarenavigate1404" with no
 obvious mapping to TiC's network names ("open-access-managed-choice",
 "choice-plus"). Forcing a plan-name match would throw out legitimate matches
@@ -133,7 +139,7 @@ just because the same contract is labeled differently by each side. Instead
 `plan_name` is carried through as context — useful for a human reviewing a
 match, not for deciding whether one exists.
 
-TiC's `taxonomy_filtered_npi_list` tells you how many providers a given rate
+**TiC's `taxonomy_filtered_npi_list`** tells you how many providers a given rate
 applies to. A rate tied to a broad NPI list looks more like a facility-wide
 default (closer to what HPT reports); a rate tied to one or two NPIs looks
 like a provider-specific carve-out. This is useful context for interpreting a
@@ -145,8 +151,7 @@ carried through in the output instead.
 The first time I ran a full join on the cleaned data, the row count exploded
 from a couple hundred rows per file into the thousands. The cause is
 structural on both sides: HPT repeats the same negotiated rate once per
-`plan_name` (the same dollar figure shows up under "All Payers", "HC Compass",
-"Choice Plus", etc. as separate rows), and TiC repeats the same rate once per
+`plan_name` , and TiC repeats the same rate once per
 NPI/network grouping. Join two files that each have this many-to-one
 repetition and every repetition on one side pairs with every repetition on the
 other — the output becomes an unreadable pile of duplicate comparisons.
@@ -178,8 +183,14 @@ combination itself doesn't exist on the other side. These get labeled
 exist on both sides, every HPT rate is compared against every TiC rate in that
 block, scored by `1 - |hpt_rate - tic_rate| / max(hpt_rate, tic_rate)`. Pairs
 are sorted by score and claimed greedily — best match first, each rate used at
-most once. A `confidence_band` is assigned from the resulting delta: `exact`
-(<0.5%), `high` (<5%), `medium` (<20%), `low` (>=20%).
+most once. A `confidence_band` is assigned from the resulting delta: 
+
+    | Band     | `abs_delta_pct` |
+    |----------|-----------------|
+    | exact    | < 0.5%          |
+    | high     | 0.5% - 5%       |
+    | medium   | 5% - 20%        |
+    | low      | > 20%           |
 
 Anything left over after the best pairs are claimed — say one HPT rate facing
 five TiC rates in the same block — is kept as `additional_rate_variant` rather
@@ -196,7 +207,7 @@ counterpart, even if that counterpart is 70%+ away. A "low" confidence label
 already communicates "this is the best available comparison, treat it with
 caution" — an arbitrary cutoff that instead dumped that rate into an
 unmatched bucket wouldn't make the information any more useful, just harder to
-find. Given the 2-3 hour scope of this exercise, a single price-proximity
+find. Given the limited time scope of this exercise, a single price-proximity
 score with transparent banding felt like the right tradeoff between
 correctness and the production-style mindset Serif described — get something
 working end to end, make every decision visible, and leave clear notes on
@@ -298,6 +309,8 @@ that block; and Mount Sinai's HPT box for CPT 99283 is empty because its only
 big-3-labeled rows for that code were Medicare Advantage plans, excluded
 upstream as non-commercial.
 
+![rate_distribution](rate_distribution.png)
+
 ## Scaling to the Full National Dataset
 
 The approach here generalizes, but a few things would need to change going
@@ -306,7 +319,7 @@ rows a month.
 
 The hospital-identity crosswalk (license number -> EIN -> hospital) was a
 3-row lookup table built by hand here. At scale this needs to be a maintained
-reference table sourced from NPPES, refreshed regularly, with NPI as the
+reference table sourced from public records, refreshed regularly, with NPI as the
 primary stable key (EINs can change when hospitals reorganize; NPIs are more
 durable) and fuzzy name/geography matching as a fallback for the records that
 don't resolve cleanly.
@@ -336,16 +349,4 @@ silently as a wave of new `excluded_non_big3_payer` rows.
 
 ## What I'd Add With More Time
 
-The current confidence score is price proximity alone. Two other signals were
-clearly present in the data and would sharpen confidence without changing the
-core architecture: comparing HPT's `standard_charge_methodology` (case rate,
-fee schedule, % of billed charges) against TiC's `negotiation_type` — two rates
-that are close in dollar terms but built on different rate structures are less
-likely to represent the same contract than two that agree on both; and using
-the date gap between each hospital's HPT `last_updated_on` and the TiC
-extract's `network_year_month` (0 days for NYU, ~105 for Mount Sinai, ~184 for
-Montefiore) as a soft penalty, since a larger gap leaves more room for routine
-escalator-clause drift to explain an otherwise-moderate delta. Neither would
-replace the price score — they'd nudge a "low" match with aligned methodology
-and a tight date gap toward "medium," and a "medium" match with mismatched
-methodology and a wide date gap toward "low."
+While the current matching model relies solely on price proximity, future iterations can refine confidence scoring by introducing a multi-factor weighting system without altering the core architecture. This future state will incorporate semantic plan and network alignment (e.g., verifying that "PPO" strings cross-reference accurately) and rate methodology alignment to ensure both data sources share identical payment method structures. Additionally, the model will account for date gaps to track contractual drift. By quantifying the time lag between the payer's monthly file generation and the hospital's less frequent updates. the system can gracefully absorb legitimate rate variances caused by annual escalator clauses. Blending these linguistic, structural, and temporal markers will adjust the baseline proximity scores, upgrading or downgrading matches into a highly interpretable and robust evaluation model.
