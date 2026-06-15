@@ -37,8 +37,7 @@ pip install pandas numpy matplotlib
 python solution.py
 ```
 
-Expects `hpt_extract_20250213.csv` and `tic_extract_20250213.csv` in the same
-directory. `payer_mapping.py` must be importable (same folder). Output is
+`hpt_extract_20250213.csv` and `tic_extract_20250213.csv` are the publicly-available price transparency extracts provided with this assignment and are included in this repo for reproducibility. `payer_mapping.py` must be importable (same folder). Output is
 `unified_rate_dataset.csv`.
 
 ---
